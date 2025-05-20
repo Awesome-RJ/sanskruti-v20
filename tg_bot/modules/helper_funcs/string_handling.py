@@ -1,258 +1,155 @@
-import re
-import time
-from typing import Dict, List
+import logging
+from typing import List, Optional, Tuple, Union
 
-import emoji
-from telegram import MessageEntity
-from telegram.utils.helpers import escape_markdown
+from telegram import Message, MessageEntity, User
+from telegram.error import BadRequest
+from telegram.ext import CallbackContext
 
-# NOTE: the url \ escape may cause double escapes
-# match * (bold) (don't escape if in url)
-# match _ (italics) (don't escape if in url)
-# match ` (code)
-# match []() (markdown link)
-# else, escape *, _, `, and [
-MATCH_MD = re.compile(r'\*(.*?)\*|'
-                      r'_(.*?)_|'
-                      r'`(.*?)`|'
-                      r'(?<!\\)(\[.*?\])(\(.*?\))|'
-                      r'(?P<esc>[*_`\[])')
-
-# regex to find []() links -> hyperlinks/buttons
-LINK_REGEX = re.compile(r'(?<!\\)\[.+?\]\((.*?)\)')
-BTN_URL_REGEX = re.compile(r"(\[([^\[]+?)\]\(buttonurl:(?:/{0,2})(.+?)(:same)?\))")
+from tg_bot import LOGGER  # Assuming this is your logger
+from tg_bot.modules.users import get_user_id # Assuming this is your user id getter
 
 
-def _selective_escape(to_parse: str) -> str:
+
+def id_from_reply(message: Message) -> Tuple[Optional[int], Optional[str]]:
     """
-    Escape all invalid markdown
+    Extracts the user ID and any accompanying text from a message that is a reply
+    to another message.
 
-    :param to_parse: text to escape
-    :return: valid markdown string
+    Args:
+        message: The Telegram message object.
+
+    Returns:
+        A tuple containing the user ID of the user who sent the original message
+        (or None if the message is not a reply) and any text that follows the
+        command in the current message.
     """
-    offset = 0  # offset to be used as adding a \ character causes the string to shift
-    for match in MATCH_MD.finditer(to_parse):
-        if match.group('esc'):
-            ent_start = match.start()
-            to_parse = to_parse[:ent_start + offset] + '\\' + to_parse[ent_start + offset:]
-            offset += 1
-    return to_parse
+    prev_message = message.reply_to_message
+    if not prev_message:
+        return None, None
+    user_id = prev_message.from_user.id
+    text = message.text.split(None, 1)
+    if len(text) < 2:
+        return user_id, ""
+    return user_id, text[1]
 
 
-# This is a fun one.
-def _calc_emoji_offset(to_calc) -> int:
-    # Get all emoji in text.
-    emoticons = emoji.get_emoji_regexp().finditer(to_calc)
-    # Check the utf16 length of the emoji to determine the offset it caused.
-    # Normal, 1 character emoji don't affect; hence sub 1.
-    # special, eg with two emoji characters (eg face, and skin col) will have length 2, so by subbing one we
-    # know we'll get one extra offset,
-    return sum(len(e.group(0).encode('utf-16-le')) // 2 - 1 for e in emoticons)
-
-
-def markdown_parser(txt: str, entities: Dict[MessageEntity, str] = None, offset: int = 0) -> str:
+def extract_user(message: Message, args: List[str]) -> Optional[int]:
     """
-    Parse a string, escaping all invalid markdown entities.
+    Extracts the user ID from a message and a list of arguments.  This function
+    is a wrapper around extract_user_and_text that only returns the user ID.
 
-    Escapes URL's so as to avoid URL mangling.
-    Re-adds any telegram code entities obtained from the entities object.
+    Args:
+        message: The Telegram message object.
+        args: A list of arguments extracted from the message text.
 
-    :param txt: text to parse
-    :param entities: dict of message entities in text
-    :param offset: message offset - command and notename length
-    :return: valid markdown string
+    Returns:
+        The user ID of the target user, or None if no user could be extracted.
     """
-    if not entities:
-        entities = {}
-    if not txt:
-        return ""
-
-    prev = 0
-    res = ""
-    # Loop over all message entities, and:
-    # reinsert code
-    # escape free-standing urls
-    for ent, ent_text in entities.items():
-        if ent.offset < -offset:
-            continue
-
-        start = ent.offset + offset  # start of entity
-        end = ent.offset + offset + ent.length - 1  # end of entity
-
-        # we only care about code, url, text links
-        if ent.type in ("code", "url", "text_link"):
-            # count emoji to switch counter
-            count = _calc_emoji_offset(txt[:start])
-            start -= count
-            end -= count
-
-            # URL handling -> do not escape if in [](), escape otherwise.
-            if ent.type == "url":
-                if any(match.start(1) <= start and end <= match.end(1) for match in LINK_REGEX.finditer(txt)):
-                    continue
-                # else, check the escapes between the prev and last and forcefully escape the url to avoid mangling
-                else:
-                    # TODO: investigate possible offset bug when lots of emoji are present
-                    res += _selective_escape(txt[prev:start] or "") + escape_markdown(ent_text)
-
-            # code handling
-            elif ent.type == "code":
-                res += _selective_escape(txt[prev:start]) + '`' + ent_text + '`'
-
-            # handle markdown/html links
-            elif ent.type == "text_link":
-                res += _selective_escape(txt[prev:start]) + "[{}]({})".format(ent_text, ent.url)
-
-            end += 1
-
-        # anything else
-        else:
-            continue
-
-        prev = end
-
-    res += _selective_escape(txt[prev:])  # add the rest of the text
-    return res
+    user_id, _ = extract_user_and_text(message, args)
+    return user_id
 
 
-def button_markdown_parser(txt: str, entities: Dict[MessageEntity, str] = None, offset: int = 0) -> (str, List):
-    markdown_note = markdown_parser(txt, entities, offset)
-    prev = 0
-    note_data = ""
-    buttons = []
-    for match in BTN_URL_REGEX.finditer(markdown_note):
-        # Check if btnurl is escaped
-        n_escapes = 0
-        to_check = match.start(1) - 1
-        while to_check > 0 and markdown_note[to_check] == "\\":
-            n_escapes += 1
-            to_check -= 1
 
-        # if even, not escaped -> create button
-        if n_escapes % 2 == 0:
-            # create a thruple with button label, url, and newline status
-            buttons.append((match.group(2), match.group(3), bool(match.group(4))))
-            note_data += markdown_note[prev:match.start(1)]
-            prev = match.end(1)
-        # if odd, escaped -> move along
-        else:
-            note_data += markdown_note[prev:to_check]
-            prev = match.start(1) - 1
+def extract_user_and_text(
+    message: Message, args: List[str]
+) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Extracts the user ID and any accompanying text from a message.  This function
+    handles several cases:
+    - Reply to a message
+    - Text mention entity
+    - Username mention (@username)
+    - User ID (numeric)
+
+    Args:
+        message: The Telegram message object.
+        args: A list of arguments extracted from the message text.
+
+    Returns:
+        A tuple containing the user ID and any text that follows the user
+        identifier in the message.  Returns (None, None) if no user ID
+        could be extracted.
+    """
+    prev_message = message.reply_to_message
+    if message.text:
+        split_text = message.text.split(None, 1)
     else:
-        note_data += markdown_note[prev:]
+        split_text = []
 
-    return note_data, buttons
+    if len(split_text) < 2 and not prev_message:
+        return None, None  # No user ID found
 
+    text = ""
+    user_id = None
 
-def escape_invalid_curly_brackets(text: str, valids: List[str]) -> str:
-    new_text = ""
-    idx = 0
-    while idx < len(text):
-        if text[idx] == "{":
-            if idx + 1 < len(text) and text[idx + 1] == "{":
-                idx += 2
-                new_text += "{{{{"
-                continue
+    if len(split_text) >= 2:
+        text_to_parse = split_text[1]
+    else:
+        text_to_parse = ""
+    
+    entities = message.entities or [] # Handle None case
+    
+    for ent in entities:
+        if ent.type == MessageEntity.TEXT_MENTION:
+            if ent.offset == message.text.find(text_to_parse): # Check if the entity is the first argument
+                user_id = ent.user.id
+                text = message.text[ent.offset + ent.length :].strip()
+                break # Important: Exit the loop after finding the relevant entity
+    
+    if user_id is None: # If user_id was not found in entities
+        if len(args) >= 1:
+            if args[0].startswith("@"):
+                user = args[0]
+                user_id = get_user_id(user)
+                if not user_id:
+                    message.reply_text(
+                        "I don't have that user in my db. You'll be able to interact with them if "
+                        "you reply to that person's message instead, or forward one of that user's messages."
+                    )
+                    return None, None
+                if len(args) > 1:
+                    text = message.text.split(None, 2)[2].strip()
+            elif args[0].isdigit():
+                user_id = int(args[0])
+                if len(args) > 1:
+                    text = message.text.split(None, 2)[2].strip()
+
+    if user_id is None and prev_message:
+        user_id, text = id_from_reply(message)
+
+    if user_id:
+        try:
+            message.bot.get_chat(user_id)
+        except BadRequest as excp:
+            if excp.message in ("User_id_invalid", "Chat not found"):
+                message.reply_text(
+                    "I don't seem to have interacted with this user before - please forward a message from "
+                    "them to give me control! (like a voodoo doll, I need a piece of them to be able "
+                    "to execute certain commands...)"
+                )
             else:
-                success = False
-                for v in valids:
-                    if text[idx:].startswith('{' + v + '}'):
-                        success = True
-                        break
-                if success:
-                    new_text += text[idx: idx + len(v) + 2]
-                    idx += len(v) + 2
-                    continue
-                else:
-                    new_text += "{{"
+                LOGGER.exception("Exception %s on user %s", excp.message, user_id)
+            return None, None
 
-        elif text[idx] == "}":
-            if idx + 1 < len(text) and text[idx + 1] == "}":
-                idx += 2
-                new_text += "}}}}"
-                continue
-            else:
-                new_text += "}}"
-
-        else:
-            new_text += text[idx]
-        idx += 1
-
-    return new_text
+    return user_id, text
 
 
-SMART_OPEN = '“'
-SMART_CLOSE = '”'
-START_CHAR = ('\'', '"', SMART_OPEN)
 
+def extract_text(message: Message) -> str:
+    """
+    Extracts the text from a message, handling different message types.
 
-def split_quotes(text: str) -> List:
-    if any(text.startswith(char) for char in START_CHAR):
-        counter = 1  # ignore first char -> is some kind of quote
-        while counter < len(text):
-            if text[counter] == "\\":
-                counter += 1
-            elif text[counter] == text[0] or (text[0] == SMART_OPEN and text[counter] == SMART_CLOSE):
-                break
-            counter += 1
-        else:
-            return text.split(None, 1)
+    Args:
+        message: The Telegram message object.
 
-        # 1 to avoid starting quote, and counter is exclusive so avoids ending
-        key = remove_escapes(text[1:counter].strip())
-        # index will be in range, or `else` would have been executed and returned
-        rest = text[counter + 1:].strip()
-        if not key:
-            key = text[0] + text[0]
-        return list(filter(None, [key, rest]))
+    Returns:
+        The extracted text, or an empty string if no text is found.
+    """
+    if message.text:
+        return message.text
+    elif message.caption:
+        return message.caption
+    elif message.sticker:
+        return message.sticker.emoji or ""  # Return empty string if no emoji
     else:
-        return text.split(None, 1)
-
-
-def remove_escapes(text: str) -> str:
-    counter = 0
-    res = ""
-    is_escaped = False
-    while counter < len(text):
-        if is_escaped:
-            res += text[counter]
-            is_escaped = False
-        elif text[counter] == "\\":
-            is_escaped = True
-        else:
-            res += text[counter]
-        counter += 1
-    return res
-
-
-def escape_chars(text: str, to_escape: List[str]) -> str:
-    to_escape.append("\\")
-    new_text = ""
-    for x in text:
-        if x in to_escape:
-            new_text += "\\"
-        new_text += x
-    return new_text
-
-
-def extract_time(message, time_val):
-    if any(time_val.endswith(unit) for unit in ('m', 'h', 'd')):
-        unit = time_val[-1]
-        time_num = time_val[:-1]  # type: str
-        if not time_num.isdigit():
-            message.reply_text("Invalid time amount specified.")
-            return ""
-
-        if unit == 'm':
-            bantime = int(time.time() + int(time_num) * 60)
-        elif unit == 'h':
-            bantime = int(time.time() + int(time_num) * 60 * 60)
-        elif unit == 'd':
-            bantime = int(time.time() + int(time_num) * 24 * 60 * 60)
-        else:
-            # how even...?
-            return ""
-        return bantime
-    else:
-        message.reply_text("Invalid time type specified. Expected m,h, or d, got: {}".format(time_val[-1]))
         return ""
